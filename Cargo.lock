@@ -1689,10 +1689,13 @@ dependencies = [
 name = "str0m-openssl"
 version = "0.1.3"
 dependencies = [
+ "dimpl",
  "libc",
  "openssl",
  "openssl-sys",
+ "pkcs8",
  "str0m-proto",
+ "time",
  "tracing",
 ]
 

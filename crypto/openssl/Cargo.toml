@@ -20,3 +20,9 @@ str0m-proto = { version = "0.1.1", path = "../../proto", features = ["openssl"] 
 openssl = { version = "0.10.70" }
 openssl-sys = { version = "0.9.80" }
 libc = { version = "0.2" }
+dimpl = { version = "0.3.0", default-features = false }
+# Pin time to avoid time-core 0.1.8+ which requires edition 2024 (rustc 1.85+)
+time = ">=0.3, <0.3.37"
+
+# PKCS#8 PEM parsing for private key loading
+pkcs8 = { version = "0.10", features = ["pem"] }
