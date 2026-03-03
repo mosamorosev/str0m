@@ -103,3 +103,7 @@ required-features = ["examples"]
 [[example]]
 name = "http-post"
 required-features = ["examples"]
+
+[[example]]
+name = "e2ee_chat"
+required-features = ["examples"]
