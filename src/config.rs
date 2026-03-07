@@ -43,6 +43,7 @@ pub struct RtcConfig {
     pub(crate) send_buffer_audio: usize,
     pub(crate) send_buffer_video: usize,
     pub(crate) rtp_mode: bool,
+    pub(crate) tunnel_mode: bool,
     pub(crate) enable_raw_packets: bool,
     pub(crate) dtls_version: DtlsVersion,
     pub(crate) vp9_packetizer_mode: Vp9PacketizerMode,
@@ -535,6 +536,34 @@ impl RtcConfig {
         self.rtp_mode
     }
 
+    /// Enable tunnel mode for E2EE pass-through.
+    ///
+    /// In tunnel mode, the SFU does **not** terminate DTLS or decrypt SRTP.
+    /// Instead, DTLS, RTP, and RTCP packets are emitted as [`Event::TunnelData`][crate::Event::TunnelData]
+    /// events for forwarding to a paired client. ICE/STUN is still processed normally.
+    ///
+    /// Use [`Rtc::write_tunnel_data()`][crate::Rtc::write_tunnel_data] to inject packets
+    /// received from the paired client for transmission to this client.
+    ///
+    /// WARNING: This is a low level API for building E2EE SFU tunnels.
+    pub fn set_tunnel_mode(mut self, enabled: bool) -> Self {
+        self.tunnel_mode = enabled;
+        self
+    }
+
+    /// Checks if tunnel mode is set.
+    ///
+    /// ```
+    /// # use str0m::Rtc;
+    /// let config = Rtc::builder();
+    ///
+    /// // Defaults to false.
+    /// assert_eq!(config.tunnel_mode(), false);
+    /// ```
+    pub fn tunnel_mode(&self) -> bool {
+        self.tunnel_mode
+    }
+
     /// Enable the [`Event::RawPacket`][crate::Event::RawPacket] event.
     ///
     /// This clones data, and is therefore expensive.
@@ -616,6 +645,7 @@ impl Default for RtcConfig {
             send_buffer_audio: 50,
             send_buffer_video: 1000,
             rtp_mode: false,
+            tunnel_mode: false,
             enable_raw_packets: false,
             dtls_version: DtlsVersion::Dtls12,
             vp9_packetizer_mode: Vp9PacketizerMode::default(),

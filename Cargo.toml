@@ -105,5 +105,5 @@ name = "http-post"
 required-features = ["examples"]
 
 [[example]]
-name = "e2ee_chat"
+name = "e2ee_tunnel"
 required-features = ["examples"]

@@ -845,6 +845,9 @@ pub struct Rtc {
     last_timeout_reason: Reason,
     crypto_provider: Arc<crate::crypto::CryptoProvider>,
     fingerprint_verification: bool,
+    tunnel_mode: bool,
+    tunnel_events: std::collections::VecDeque<Event>,
+    tunnel_send_queue: std::collections::VecDeque<net::DatagramSend>,
 }
 
 struct SendAddr {
@@ -952,11 +955,93 @@ pub enum Event {
     /// Should not be enabled outside of tests and troubleshooting.
     RawPacket(Box<RawPacket>),
 
+    /// Raw DTLS/SRTP/SRTCP packet in tunnel mode.
+    ///
+    /// Emitted when [`RtcConfig::set_tunnel_mode()`] is enabled. The SFU should
+    /// forward this data to the paired client via
+    /// [`Rtc::write_tunnel_data()`] on the other `Rtc` instance.
+    TunnelData(TunnelData),
+
     /// For internal testing only.
     ///
     /// The probe cluster config when a probe fires.
     #[cfg(feature = "_internal_test_exports")]
     Probe(crate::bwe_::ProbeClusterConfig),
+}
+
+/// Type of tunneled packet in [`Event::TunnelData`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelPacketType {
+    /// DTLS handshake/alert packet (content type byte 0x14-0x17).
+    Dtls,
+    /// SRTP-encrypted RTP packet.
+    Rtp,
+    /// SRTCP-encrypted RTCP packet.
+    Rtcp,
+}
+
+/// Raw tunneled packet emitted in tunnel mode.
+///
+/// In tunnel mode, str0m does not process DTLS/SRTP/SRTCP.
+/// Instead these packets are emitted as events for forwarding
+/// to a paired client.
+#[derive(Debug)]
+pub struct TunnelData {
+    /// The type of packet.
+    pub pkt_type: TunnelPacketType,
+    /// Raw packet bytes (not processed by str0m).
+    pub data: Vec<u8>,
+}
+
+impl TunnelData {
+    /// Extract the SSRC from an RTP/RTCP packet's fixed header.
+    ///
+    /// For RTP: SSRC is at bytes 8-11.
+    /// For RTCP: sender SSRC is at bytes 4-7.
+    /// Returns `None` for DTLS packets or if data is too short.
+    pub fn ssrc(&self) -> Option<u32> {
+        match self.pkt_type {
+            TunnelPacketType::Rtp if self.data.len() >= 12 => {
+                Some(u32::from_be_bytes([
+                    self.data[8],
+                    self.data[9],
+                    self.data[10],
+                    self.data[11],
+                ]))
+            }
+            TunnelPacketType::Rtcp if self.data.len() >= 8 => {
+                Some(u32::from_be_bytes([
+                    self.data[4],
+                    self.data[5],
+                    self.data[6],
+                    self.data[7],
+                ]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the payload type from an RTP packet header.
+    ///
+    /// Returns `None` for non-RTP packets or if data is too short.
+    pub fn rtp_payload_type(&self) -> Option<u8> {
+        if self.pkt_type == TunnelPacketType::Rtp && self.data.len() >= 2 {
+            Some(self.data[1] & 0x7F)
+        } else {
+            None
+        }
+    }
+
+    /// Extract the sequence number from an RTP packet header.
+    ///
+    /// Returns `None` for non-RTP packets or if data is too short.
+    pub fn rtp_sequence_number(&self) -> Option<u16> {
+        if self.pkt_type == TunnelPacketType::Rtp && self.data.len() >= 4 {
+            Some(u16::from_be_bytes([self.data[2], self.data[3]]))
+        } else {
+            None
+        }
+    }
 }
 
 impl Event {
@@ -1180,6 +1265,9 @@ impl Rtc {
             last_timeout_reason: Reason::NotHappening,
             crypto_provider,
             fingerprint_verification: config.fingerprint_verification,
+            tunnel_mode: config.tunnel_mode,
+            tunnel_events: std::collections::VecDeque::new(),
+            tunnel_send_queue: std::collections::VecDeque::new(),
         })
     }
 
@@ -1227,6 +1315,27 @@ impl Rtc {
             debug!("Set alive=false");
             self.alive = false;
         }
+    }
+
+    /// Queue raw packet data for transmission to the remote peer in tunnel mode.
+    ///
+    /// In tunnel mode, the SFU receives [`Event::TunnelData`] from one client's `Rtc`
+    /// and injects it into the paired client's `Rtc` via this method. The data is
+    /// sent over the ICE-established path on the next [`Rtc::poll_output()`].
+    ///
+    /// Panics if called when tunnel mode is not enabled.
+    pub fn write_tunnel_data(&mut self, data: Vec<u8>) {
+        assert!(
+            self.tunnel_mode,
+            "write_tunnel_data requires tunnel_mode to be enabled"
+        );
+        self.tunnel_send_queue
+            .push_back(net::DatagramSend::from(data));
+    }
+
+    /// Whether this Rtc instance is in tunnel mode.
+    pub fn is_tunnel_mode(&self) -> bool {
+        self.tunnel_mode
     }
 
     /// Add a local ICE candidate. Local candidates are socket addresses the `Rtc` instance
@@ -1441,7 +1550,8 @@ impl Rtc {
                 | Event::MediaIngressStats(_)
                 | Event::PeerStats(_)
                 | Event::ChannelBufferedAmountLow(_)
-                | Event::EgressBitrateEstimate(_) => {
+                | Event::EgressBitrateEstimate(_)
+                | Event::TunnelData(_) => {
                     trace!("{:?}", e)
                 }
                 _ => debug!("{:?}", e),
@@ -1497,129 +1607,140 @@ impl Rtc {
             }
         }
 
-        // Poll DTLS output - collect packets, handle events
-        let mut just_connected = false;
-        loop {
-            match self.dtls.poll_output(&mut self.dtls_buf) {
-                DtlsOutput::Packet(_) => {
-                    unreachable!("We don't expect DTLS packets here since we use poll_packet");
-                }
-                DtlsOutput::Connected => {
-                    if !self.dtls_connected {
-                        debug!("DTLS connected");
-                        self.dtls_connected = true;
-                        just_connected = true;
-                    }
-                }
-                DtlsOutput::KeyingMaterial(km, profile) => {
-                    use config::KeyingMaterial;
-                    let km_bytes = km.as_ref().to_vec();
-                    debug!("DTLS set SRTP keying material and profile: {}", profile);
-                    let active = self.dtls.is_active().expect("DTLS must be inited by now");
-                    self.session.set_keying_material(
-                        KeyingMaterial::new(&km_bytes),
-                        &self.crypto_provider,
-                        profile,
-                        active,
-                    );
-                }
-                DtlsOutput::PeerCert(der) => {
-                    debug!("DTLS verify remote fingerprint");
-                    // Compute fingerprint from peer's DER certificate
-                    let fingerprint = crate::crypto::Fingerprint {
-                        hash_func: "sha-256".to_string(),
-                        bytes: self.crypto_provider.sha256_provider.sha256(der).to_vec(),
-                    };
-                    self.dtls.set_remote_fingerprint(fingerprint.clone());
-                    if let Some(expected) = &self.remote_fingerprint {
-                        if !self.fingerprint_verification {
-                            debug!("DTLS fingerprint verification disabled");
-                        } else if fingerprint != *expected {
-                            self.disconnect();
-                            return Err(RtcError::RemoteSdp("remote fingerprint no match".into()));
-                        }
-                    } else {
-                        self.disconnect();
-                        return Err(RtcError::RemoteSdp("no a=fingerprint before dtls".into()));
-                    }
-                }
-                DtlsOutput::ApplicationData(data) => {
-                    self.sctp.handle_input(self.last_now, data);
-                }
-                DtlsOutput::Timeout(t) => {
-                    self.next_dtls_timeout = Some(t);
-                    break;
-                }
+        // In tunnel mode, skip DTLS/SCTP/session processing — those packets
+        // are forwarded as TunnelData events instead.
+        if self.tunnel_mode {
+            // Drain queued tunnel events (DTLS/RTP/RTCP from do_handle_receive)
+            if let Some(ev) = self.tunnel_events.pop_front() {
+                return Ok(Output::Event(ev));
             }
-        }
+        } else {
+            // Normal mode: process DTLS, SCTP, session events
 
-        if just_connected {
-            return Ok(Output::Event(Event::Connected));
-        }
-
-        while let Some(e) = self.sctp.poll() {
-            match e {
-                SctpEvent::Transmit { mut packets } => {
-                    if let Some(v) = packets.front() {
-                        if let Err(e) = self.dtls.handle_input(v) {
-                            if is_would_block(&e) {
-                                self.sctp.push_back_transmit(packets);
-                                break;
-                            } else {
-                                return Err(e.into());
+            // Poll DTLS output - collect packets, handle events
+            let mut just_connected = false;
+            loop {
+                match self.dtls.poll_output(&mut self.dtls_buf) {
+                    DtlsOutput::Packet(_) => {
+                        unreachable!("We don't expect DTLS packets here since we use poll_packet");
+                    }
+                    DtlsOutput::Connected => {
+                        if !self.dtls_connected {
+                            debug!("DTLS connected");
+                            self.dtls_connected = true;
+                            just_connected = true;
+                        }
+                    }
+                    DtlsOutput::KeyingMaterial(km, profile) => {
+                        use config::KeyingMaterial;
+                        let km_bytes = km.as_ref().to_vec();
+                        debug!("DTLS set SRTP keying material and profile: {}", profile);
+                        let active = self.dtls.is_active().expect("DTLS must be inited by now");
+                        self.session.set_keying_material(
+                            KeyingMaterial::new(&km_bytes),
+                            &self.crypto_provider,
+                            profile,
+                            active,
+                        );
+                    }
+                    DtlsOutput::PeerCert(der) => {
+                        debug!("DTLS verify remote fingerprint");
+                        // Compute fingerprint from peer's DER certificate
+                        let fingerprint = crate::crypto::Fingerprint {
+                            hash_func: "sha-256".to_string(),
+                            bytes: self.crypto_provider.sha256_provider.sha256(der).to_vec(),
+                        };
+                        self.dtls.set_remote_fingerprint(fingerprint.clone());
+                        if let Some(expected) = &self.remote_fingerprint {
+                            if !self.fingerprint_verification {
+                                debug!("DTLS fingerprint verification disabled");
+                            } else if fingerprint != *expected {
+                                self.disconnect();
+                                return Err(RtcError::RemoteSdp("remote fingerprint no match".into()));
                             }
+                        } else {
+                            self.disconnect();
+                            return Err(RtcError::RemoteSdp("no a=fingerprint before dtls".into()));
                         }
-
-                        packets.pop_front();
-                        // If there are still packets, they are sent on next
-                        // poll_output()
-                        if !packets.is_empty() {
-                            self.sctp.push_back_transmit(packets);
-                        }
-
-                        // Run again since this would feed the DTLS subsystem
-                        // to produce a packet now.
-                        return self.do_poll_output();
+                    }
+                    DtlsOutput::ApplicationData(data) => {
+                        self.sctp.handle_input(self.last_now, data);
+                    }
+                    DtlsOutput::Timeout(t) => {
+                        self.next_dtls_timeout = Some(t);
+                        break;
                     }
                 }
-                SctpEvent::Open { id, label } => {
-                    self.chan.ensure_channel_id_for(id);
-                    let id = self.chan.channel_id_by_stream_id(id).unwrap();
-                    return Ok(Output::Event(Event::ChannelOpen(id, label)));
-                }
-                SctpEvent::Close { id } => {
-                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
-                        warn!("Drop ChannelClose event for id: {:?}", id);
-                        continue;
-                    };
-                    self.chan.remove_channel(id);
-                    return Ok(Output::Event(Event::ChannelClose(id)));
-                }
-                SctpEvent::Data { id, binary, data } => {
-                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
-                        warn!("Drop ChannelData event for id: {:?}", id);
-                        continue;
-                    };
-                    let cd = ChannelData { id, binary, data };
-                    return Ok(Output::Event(Event::ChannelData(cd)));
-                }
-                SctpEvent::BufferedAmountLow { id } => {
-                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
-                        warn!("Drop BufferedAmountLow for id: {:?}", id);
-                        continue;
-                    };
-                    return Ok(Output::Event(Event::ChannelBufferedAmountLow(id)));
+            }
+
+            if just_connected {
+                return Ok(Output::Event(Event::Connected));
+            }
+
+            while let Some(e) = self.sctp.poll() {
+                match e {
+                    SctpEvent::Transmit { mut packets } => {
+                        if let Some(v) = packets.front() {
+                            if let Err(e) = self.dtls.handle_input(v) {
+                                if is_would_block(&e) {
+                                    self.sctp.push_back_transmit(packets);
+                                    break;
+                                } else {
+                                    return Err(e.into());
+                                }
+                            }
+
+                            packets.pop_front();
+                            // If there are still packets, they are sent on next
+                            // poll_output()
+                            if !packets.is_empty() {
+                                self.sctp.push_back_transmit(packets);
+                            }
+
+                            // Run again since this would feed the DTLS subsystem
+                            // to produce a packet now.
+                            return self.do_poll_output();
+                        }
+                    }
+                    SctpEvent::Open { id, label } => {
+                        self.chan.ensure_channel_id_for(id);
+                        let id = self.chan.channel_id_by_stream_id(id).unwrap();
+                        return Ok(Output::Event(Event::ChannelOpen(id, label)));
+                    }
+                    SctpEvent::Close { id } => {
+                        let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                            warn!("Drop ChannelClose event for id: {:?}", id);
+                            continue;
+                        };
+                        self.chan.remove_channel(id);
+                        return Ok(Output::Event(Event::ChannelClose(id)));
+                    }
+                    SctpEvent::Data { id, binary, data } => {
+                        let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                            warn!("Drop ChannelData event for id: {:?}", id);
+                            continue;
+                        };
+                        let cd = ChannelData { id, binary, data };
+                        return Ok(Output::Event(Event::ChannelData(cd)));
+                    }
+                    SctpEvent::BufferedAmountLow { id } => {
+                        let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                            warn!("Drop BufferedAmountLow for id: {:?}", id);
+                            continue;
+                        };
+                        return Ok(Output::Event(Event::ChannelBufferedAmountLow(id)));
+                    }
                 }
             }
-        }
 
-        if let Some(ev) = self.session.poll_event() {
-            return Ok(Output::Event(ev));
-        }
+            if let Some(ev) = self.session.poll_event() {
+                return Ok(Output::Event(ev));
+            }
 
-        // Some polling needs to bubble up errors.
-        if let Some(ev) = self.session.poll_event_fallible()? {
-            return Ok(Output::Event(ev));
+            // Some polling needs to bubble up errors.
+            if let Some(ev) = self.session.poll_event_fallible()? {
+                return Ok(Output::Event(ev));
+            }
         }
 
         if let Some(e) = self.stats.as_mut().and_then(|s| s.poll_output()) {
@@ -1636,9 +1757,14 @@ impl Rtc {
 
         if let Some(send) = &self.send_addr {
             // These can only be sent after we got an ICE connection.
-            let datagram = None
-                .or_else(|| self.dtls.poll_packet())
-                .or_else(|| self.session.poll_datagram(self.last_now));
+            let datagram = if self.tunnel_mode {
+                // In tunnel mode, only drain the tunnel send queue
+                self.tunnel_send_queue.pop_front()
+            } else {
+                None
+                    .or_else(|| self.dtls.poll_packet())
+                    .or_else(|| self.session.poll_datagram(self.last_now))
+            };
 
             if let Some(contents) = datagram {
                 let t = net::Transmit {
@@ -1656,37 +1782,56 @@ impl Rtc {
 
         let stats = self.stats.as_mut();
 
-        // Handle DTLS timeout
-        if let Some(timeout) = self.next_dtls_timeout {
-            if timeout <= self.last_now {
-                let _ = self.dtls.handle_timeout(self.last_now);
-                self.next_dtls_timeout = None;
-            }
-        }
+        if self.tunnel_mode {
+            // In tunnel mode, only ICE and stats produce timeouts
+            let time_and_reason = (None, Reason::NotHappening)
+                .soonest((self.ice.poll_timeout(), Reason::Ice))
+                .soonest((stats.and_then(|s| s.poll_timeout()), Reason::Stats));
 
-        let time_and_reason = (None, Reason::NotHappening)
-            .soonest((self.next_dtls_timeout, Reason::DTLS))
-            .soonest((self.ice.poll_timeout(), Reason::Ice))
-            .soonest(self.session.poll_timeout())
-            .soonest((self.sctp.poll_timeout(), Reason::Sctp))
-            .soonest((self.chan.poll_timeout(&self.sctp), Reason::Channel))
-            .soonest((stats.and_then(|s| s.poll_timeout()), Reason::Stats));
+            let time = time_and_reason.0.unwrap_or_else(not_happening);
+            let reason = time_and_reason.1;
 
-        // trace!("poll_output timeout reason: {}", time_and_reason.1);
+            let next = if time < self.last_now {
+                self.last_now
+            } else {
+                time
+            };
 
-        let time = time_and_reason.0.unwrap_or_else(not_happening);
-        let reason = time_and_reason.1;
-
-        // We want to guarantee time doesn't go backwards.
-        let next = if time < self.last_now {
-            self.last_now
+            self.last_timeout_reason = reason;
+            Ok(Output::Timeout(next))
         } else {
-            time
-        };
+            // Handle DTLS timeout
+            if let Some(timeout) = self.next_dtls_timeout {
+                if timeout <= self.last_now {
+                    let _ = self.dtls.handle_timeout(self.last_now);
+                    self.next_dtls_timeout = None;
+                }
+            }
 
-        self.last_timeout_reason = reason;
+            let time_and_reason = (None, Reason::NotHappening)
+                .soonest((self.next_dtls_timeout, Reason::DTLS))
+                .soonest((self.ice.poll_timeout(), Reason::Ice))
+                .soonest(self.session.poll_timeout())
+                .soonest((self.sctp.poll_timeout(), Reason::Sctp))
+                .soonest((self.chan.poll_timeout(&self.sctp), Reason::Channel))
+                .soonest((stats.and_then(|s| s.poll_timeout()), Reason::Stats));
 
-        Ok(Output::Timeout(next))
+            // trace!("poll_output timeout reason: {}", time_and_reason.1);
+
+            let time = time_and_reason.0.unwrap_or_else(not_happening);
+            let reason = time_and_reason.1;
+
+            // We want to guarantee time doesn't go backwards.
+            let next = if time < self.last_now {
+                self.last_now
+            } else {
+                time
+            };
+
+            self.last_timeout_reason = reason;
+
+            Ok(Output::Timeout(next))
+        }
     }
 
     /// The reason for the last [`Output::Timeout`]
@@ -1885,9 +2030,36 @@ impl Rtc {
                 };
                 self.ice.handle_packet(recv_time, packet);
             }
-            Dtls(dtls) => self.dtls.handle_receive(dtls)?,
-            Rtp(rtp) => self.session.handle_rtp_receive(recv_time, rtp),
-            Rtcp(rtcp) => self.session.handle_rtcp_receive(recv_time, rtcp),
+            Dtls(dtls) => {
+                if self.tunnel_mode {
+                    self.tunnel_events.push_back(Event::TunnelData(TunnelData {
+                        pkt_type: TunnelPacketType::Dtls,
+                        data: dtls.to_vec(),
+                    }));
+                } else {
+                    self.dtls.handle_receive(dtls)?;
+                }
+            }
+            Rtp(rtp) => {
+                if self.tunnel_mode {
+                    self.tunnel_events.push_back(Event::TunnelData(TunnelData {
+                        pkt_type: TunnelPacketType::Rtp,
+                        data: rtp.to_vec(),
+                    }));
+                } else {
+                    self.session.handle_rtp_receive(recv_time, rtp);
+                }
+            }
+            Rtcp(rtcp) => {
+                if self.tunnel_mode {
+                    self.tunnel_events.push_back(Event::TunnelData(TunnelData {
+                        pkt_type: TunnelPacketType::Rtcp,
+                        data: rtcp.to_vec(),
+                    }));
+                } else {
+                    self.session.handle_rtcp_receive(recv_time, rtcp);
+                }
+            }
         }
 
         Ok(())
