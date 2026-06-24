@@ -21,6 +21,8 @@ mod srtp;
 pub(crate) use srtp::SrtpContext;
 pub(crate) use srtp::{SRTCP_OVERHEAD, SRTP_BLOCK_SIZE, SRTP_OVERHEAD};
 
+pub mod ohb;
+
 mod rtcp;
 pub use rtcp::*;
 

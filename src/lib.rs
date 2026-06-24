@@ -716,6 +716,12 @@ pub mod rtp {
 
     /// Video Layers Allocation RTP Header Extension
     pub mod vla;
+
+    /// Original Header Block for PERC double encryption (RFC 8723 §4).
+    pub mod ohb {
+        pub use crate::rtp_::ohb::Ohb;
+    }
+
     pub use crate::rtp_::{AbsCaptureTime, ExtensionValues, UserExtensionValues};
     pub use crate::rtp_::{Extension, ExtensionMap, ExtensionSerializer};
 
