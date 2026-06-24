@@ -1,10 +1,10 @@
 //! PERC Double Encryption SFU Example (RFC 8723 / RFC 8871)
 //!
-//! Phase 2 of the PERC E2EE architecture. This SFU uses normal DTLS-SRTP
-//! (hop-by-hop encryption) with each client independently, while the E2E
-//! encrypted payload passes through opaquely.
+//! An end-to-end encrypted SFU. It uses normal DTLS-SRTP (hop-by-hop
+//! encryption) with each client independently, while the inner E2E encrypted
+//! payload passes through opaquely — the SFU routes media it can never decrypt.
 //!
-//! ## How it differs from `e2ee_tunnel`
+//! ## How it works
 //!
 //! - **Normal DTLS-SRTP** — SFU terminates DTLS with each client independently.
 //!   Each client has unique HBH SRTP keys with the SFU.
@@ -12,7 +12,7 @@
 //!   The inner E2E encrypted payload is treated as opaque bytes.
 //! - **OHB** — Original Header Block (RFC 8723 §4) tracks any RTP header
 //!   modifications the SFU makes during forwarding.
-//! - **No fingerprint swapping** — each client does its own DTLS with the SFU.
+//! - **Per-client DTLS** — each client does its own DTLS with the SFU.
 //!
 //! ## Signaling Protocol (N:N conference, dynamic)
 //!

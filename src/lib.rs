@@ -851,9 +851,6 @@ pub struct Rtc {
     last_timeout_reason: Reason,
     crypto_provider: Arc<crate::crypto::CryptoProvider>,
     fingerprint_verification: bool,
-    tunnel_mode: bool,
-    tunnel_events: std::collections::VecDeque<Event>,
-    tunnel_send_queue: std::collections::VecDeque<net::DatagramSend>,
 }
 
 struct SendAddr {
@@ -961,93 +958,11 @@ pub enum Event {
     /// Should not be enabled outside of tests and troubleshooting.
     RawPacket(Box<RawPacket>),
 
-    /// Raw DTLS/SRTP/SRTCP packet in tunnel mode.
-    ///
-    /// Emitted when [`RtcConfig::set_tunnel_mode()`] is enabled. The SFU should
-    /// forward this data to the paired client via
-    /// [`Rtc::write_tunnel_data()`] on the other `Rtc` instance.
-    TunnelData(TunnelData),
-
     /// For internal testing only.
     ///
     /// The probe cluster config when a probe fires.
     #[cfg(feature = "_internal_test_exports")]
     Probe(crate::bwe_::ProbeClusterConfig),
-}
-
-/// Type of tunneled packet in [`Event::TunnelData`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TunnelPacketType {
-    /// DTLS handshake/alert packet (content type byte 0x14-0x17).
-    Dtls,
-    /// SRTP-encrypted RTP packet.
-    Rtp,
-    /// SRTCP-encrypted RTCP packet.
-    Rtcp,
-}
-
-/// Raw tunneled packet emitted in tunnel mode.
-///
-/// In tunnel mode, str0m does not process DTLS/SRTP/SRTCP.
-/// Instead these packets are emitted as events for forwarding
-/// to a paired client.
-#[derive(Debug)]
-pub struct TunnelData {
-    /// The type of packet.
-    pub pkt_type: TunnelPacketType,
-    /// Raw packet bytes (not processed by str0m).
-    pub data: Vec<u8>,
-}
-
-impl TunnelData {
-    /// Extract the SSRC from an RTP/RTCP packet's fixed header.
-    ///
-    /// For RTP: SSRC is at bytes 8-11.
-    /// For RTCP: sender SSRC is at bytes 4-7.
-    /// Returns `None` for DTLS packets or if data is too short.
-    pub fn ssrc(&self) -> Option<u32> {
-        match self.pkt_type {
-            TunnelPacketType::Rtp if self.data.len() >= 12 => {
-                Some(u32::from_be_bytes([
-                    self.data[8],
-                    self.data[9],
-                    self.data[10],
-                    self.data[11],
-                ]))
-            }
-            TunnelPacketType::Rtcp if self.data.len() >= 8 => {
-                Some(u32::from_be_bytes([
-                    self.data[4],
-                    self.data[5],
-                    self.data[6],
-                    self.data[7],
-                ]))
-            }
-            _ => None,
-        }
-    }
-
-    /// Extract the payload type from an RTP packet header.
-    ///
-    /// Returns `None` for non-RTP packets or if data is too short.
-    pub fn rtp_payload_type(&self) -> Option<u8> {
-        if self.pkt_type == TunnelPacketType::Rtp && self.data.len() >= 2 {
-            Some(self.data[1] & 0x7F)
-        } else {
-            None
-        }
-    }
-
-    /// Extract the sequence number from an RTP packet header.
-    ///
-    /// Returns `None` for non-RTP packets or if data is too short.
-    pub fn rtp_sequence_number(&self) -> Option<u16> {
-        if self.pkt_type == TunnelPacketType::Rtp && self.data.len() >= 4 {
-            Some(u16::from_be_bytes([self.data[2], self.data[3]]))
-        } else {
-            None
-        }
-    }
 }
 
 impl Event {
@@ -1271,9 +1186,6 @@ impl Rtc {
             last_timeout_reason: Reason::NotHappening,
             crypto_provider,
             fingerprint_verification: config.fingerprint_verification,
-            tunnel_mode: config.tunnel_mode,
-            tunnel_events: std::collections::VecDeque::new(),
-            tunnel_send_queue: std::collections::VecDeque::new(),
         })
     }
 
@@ -1321,27 +1233,6 @@ impl Rtc {
             debug!("Set alive=false");
             self.alive = false;
         }
-    }
-
-    /// Queue raw packet data for transmission to the remote peer in tunnel mode.
-    ///
-    /// In tunnel mode, the SFU receives [`Event::TunnelData`] from one client's `Rtc`
-    /// and injects it into the paired client's `Rtc` via this method. The data is
-    /// sent over the ICE-established path on the next [`Rtc::poll_output()`].
-    ///
-    /// Panics if called when tunnel mode is not enabled.
-    pub fn write_tunnel_data(&mut self, data: Vec<u8>) {
-        assert!(
-            self.tunnel_mode,
-            "write_tunnel_data requires tunnel_mode to be enabled"
-        );
-        self.tunnel_send_queue
-            .push_back(net::DatagramSend::from(data));
-    }
-
-    /// Whether this Rtc instance is in tunnel mode.
-    pub fn is_tunnel_mode(&self) -> bool {
-        self.tunnel_mode
     }
 
     /// Add a local ICE candidate. Local candidates are socket addresses the `Rtc` instance
@@ -1556,8 +1447,7 @@ impl Rtc {
                 | Event::MediaIngressStats(_)
                 | Event::PeerStats(_)
                 | Event::ChannelBufferedAmountLow(_)
-                | Event::EgressBitrateEstimate(_)
-                | Event::TunnelData(_) => {
+                | Event::EgressBitrateEstimate(_) => {
                     trace!("{:?}", e)
                 }
                 _ => debug!("{:?}", e),
@@ -1613,15 +1503,8 @@ impl Rtc {
             }
         }
 
-        // In tunnel mode, skip DTLS/SCTP/session processing — those packets
-        // are forwarded as TunnelData events instead.
-        if self.tunnel_mode {
-            // Drain queued tunnel events (DTLS/RTP/RTCP from do_handle_receive)
-            if let Some(ev) = self.tunnel_events.pop_front() {
-                return Ok(Output::Event(ev));
-            }
-        } else {
-            // Normal mode: process DTLS, SCTP, session events
+        // Process DTLS, SCTP, session events.
+        {
 
             // Poll DTLS output - collect packets, handle events
             let mut just_connected = false;
@@ -1763,14 +1646,9 @@ impl Rtc {
 
         if let Some(send) = &self.send_addr {
             // These can only be sent after we got an ICE connection.
-            let datagram = if self.tunnel_mode {
-                // In tunnel mode, only drain the tunnel send queue
-                self.tunnel_send_queue.pop_front()
-            } else {
-                None
-                    .or_else(|| self.dtls.poll_packet())
-                    .or_else(|| self.session.poll_datagram(self.last_now))
-            };
+            let datagram = None
+                .or_else(|| self.dtls.poll_packet())
+                .or_else(|| self.session.poll_datagram(self.last_now));
 
             if let Some(contents) = datagram {
                 let t = net::Transmit {
@@ -1788,24 +1666,7 @@ impl Rtc {
 
         let stats = self.stats.as_mut();
 
-        if self.tunnel_mode {
-            // In tunnel mode, only ICE and stats produce timeouts
-            let time_and_reason = (None, Reason::NotHappening)
-                .soonest((self.ice.poll_timeout(), Reason::Ice))
-                .soonest((stats.and_then(|s| s.poll_timeout()), Reason::Stats));
-
-            let time = time_and_reason.0.unwrap_or_else(not_happening);
-            let reason = time_and_reason.1;
-
-            let next = if time < self.last_now {
-                self.last_now
-            } else {
-                time
-            };
-
-            self.last_timeout_reason = reason;
-            Ok(Output::Timeout(next))
-        } else {
+        {
             // Handle DTLS timeout
             if let Some(timeout) = self.next_dtls_timeout {
                 if timeout <= self.last_now {
@@ -2037,34 +1898,13 @@ impl Rtc {
                 self.ice.handle_packet(recv_time, packet);
             }
             Dtls(dtls) => {
-                if self.tunnel_mode {
-                    self.tunnel_events.push_back(Event::TunnelData(TunnelData {
-                        pkt_type: TunnelPacketType::Dtls,
-                        data: dtls.to_vec(),
-                    }));
-                } else {
-                    self.dtls.handle_receive(dtls)?;
-                }
+                self.dtls.handle_receive(dtls)?;
             }
             Rtp(rtp) => {
-                if self.tunnel_mode {
-                    self.tunnel_events.push_back(Event::TunnelData(TunnelData {
-                        pkt_type: TunnelPacketType::Rtp,
-                        data: rtp.to_vec(),
-                    }));
-                } else {
-                    self.session.handle_rtp_receive(recv_time, rtp);
-                }
+                self.session.handle_rtp_receive(recv_time, rtp);
             }
             Rtcp(rtcp) => {
-                if self.tunnel_mode {
-                    self.tunnel_events.push_back(Event::TunnelData(TunnelData {
-                        pkt_type: TunnelPacketType::Rtcp,
-                        data: rtcp.to_vec(),
-                    }));
-                } else {
-                    self.session.handle_rtcp_receive(recv_time, rtcp);
-                }
+                self.session.handle_rtcp_receive(recv_time, rtcp);
             }
         }
 
