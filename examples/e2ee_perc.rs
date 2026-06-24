@@ -14,11 +14,21 @@
 //!   modifications the SFU makes during forwarding.
 //! - **No fingerprint swapping** — each client does its own DTLS with the SFU.
 //!
-//! ## Signaling Protocol
+//! ## Signaling Protocol (N:N conference, dynamic)
 //!
-//! 1. Client A:  `POST /offer`  → `{room_id, status: "waiting"}`
-//! 2. Client B:  `POST /offer`  → `{room_id, status: "paired", answer: <SDP>}`
-//! 3. Client A:  `GET /answer?room=<id>` → `{answer: <SDP>}`
+//! 1. Client:  `POST /offer` with `{type, sdp, room, name}` → `{type, sdp, client_id}`
+//!    The `room` field is the conference id; clients sharing a `room` see each
+//!    other. Each client does its own DTLS-SRTP with the SFU (no pairing), and
+//!    the answer (plus an assigned `client_id`) is returned immediately.
+//! 2. Client:  `GET /signal?client_id=N` → `{reoffer, recv_slots}`
+//!    Polled by each client. `recv_slots` is how many receive m-lines per media
+//!    kind it should offer (one per *other* participant). When this exceeds what
+//!    it currently has, the client adds `recvonly` transceivers and re-offers.
+//! 3. Client:  `POST /offer` with `{..., client_id}` → renegotiation. The SFU
+//!    accepts the re-offer on the existing `Rtc`, growing its receive-slot pool.
+//!
+//! The conference grows and shrinks dynamically — there is no fixed slot pool
+//! and no participant cap. A 2-party call needs no renegotiation at all.
 //!
 //! ## Usage
 //!
@@ -29,9 +39,9 @@
 #[macro_use]
 extern crate tracing;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -39,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use rouille::Server;
 use rouille::{Request, Response};
-use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::change::SdpOffer;
 use str0m::crypto::from_feature_flags;
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt};
 use str0m::net::{Protocol, Receive};
@@ -61,29 +71,45 @@ fn init_log(level: &str) {
         .init();
 }
 
-// ─── Room State ───────────────────────────────────────────
+// ─── Conference State ──────────────────────────────────────
+//
+// N:N model: clients are grouped into conferences by `conf_id`. Each client
+// has its own independent DTLS-SRTP session with the SFU (rtp_mode) — there is
+// no DTLS tunnel and no client pairing. The SFU fans out every sender's RTP to
+// all OTHER clients in the same conference. The inner E2E encrypted payload
+// passes through opaquely; the SFU never decrypts it.
 
-/// A room pairs two clients. Each has independent DTLS-SRTP with the SFU.
-struct Room {
-    rtc_a: Option<Rtc>,
-    answer_a: Option<SdpAnswer>,
-    /// A's media info: (mid, kind) for each m-line
-    media_a: Vec<(Mid, MediaKind)>,
-    rtc_b: Option<Rtc>,
-    /// B's media info
-    media_b: Vec<(Mid, MediaKind)>,
+/// A signaling request handed from the web thread to the run loop. It carries
+/// either a fresh join (`client_id == None`) or a renegotiation from an
+/// already-connected client (`client_id == Some(id)`), which adds receive
+/// slots so the conference can grow dynamically. The run loop owns every `Rtc`,
+/// so all SDP work (accept_offer for both join and renegotiation) happens there
+/// and the resulting answer is sent back over `reply`.
+struct OfferRequest {
+    /// `None` for an initial join; `Some(id)` for a renegotiation re-offer.
+    client_id: Option<usize>,
+    conf_id: String,
+    name: String,
+    sdp: String,
+    reply: SyncSender<OfferReply>,
 }
 
-type Rooms = Arc<Mutex<HashMap<String, Room>>>;
-
-/// Message to the run loop: a paired room is ready
-struct PairedRoom {
-    room_id: String,
-    rtc_a: Rtc,
-    rtc_b: Rtc,
-    media_a: Vec<(Mid, MediaKind)>,
-    media_b: Vec<(Mid, MediaKind)>,
+/// The run loop's response to an [`OfferRequest`], returned to the HTTP client.
+struct OfferReply {
+    ok: bool,
+    /// The id assigned to (or matched for) this client.
+    client_id: usize,
+    /// The SDP answer string the client sets as its remote description.
+    answer_sdp: String,
+    error: Option<String>,
 }
+
+/// Per-client renegotiation instructions, shared between the web thread (which
+/// serves them over `GET /signal`) and the run loop (which recomputes them when
+/// conference membership changes). Maps `client id → desired receive slots per
+/// media kind`. A client that has fewer receive m-lines than this re-offers to
+/// add the difference; once satisfied the instruction is a harmless no-op.
+type ReofferState = Arc<Mutex<HashMap<usize, usize>>>;
 
 // ─── SDP Helpers ──────────────────────────────────────────
 
@@ -124,7 +150,8 @@ pub fn main() {
 
     let host_addr = util::select_host_address();
 
-    let (tx, rx) = mpsc::sync_channel::<PairedRoom>(4);
+    let (tx, rx) = mpsc::sync_channel::<OfferRequest>(8);
+    let reoffer: ReofferState = Arc::new(Mutex::new(HashMap::new()));
 
     // UDP bind: config udpHost (default to discovered host) + udpPort (0=random).
     let udp_host = util::cfg_str(&cfg, "udpHost", &host_addr.to_string());
@@ -134,17 +161,16 @@ pub fn main() {
     let addr = socket.local_addr().expect("a local socket address");
     info!("Bound UDP port: {}", addr);
 
-    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
-
     let stats_interval = util::cfg_u64(&cfg, "statsIntervalSec", 5);
     let wire_log = util::cfg_bool(&cfg, "diagnostics.wireLog", true);
-    thread::spawn(move || run(socket, rx, stats_interval, wire_log));
+    let reoffer_run = reoffer.clone();
+    thread::spawn(move || run(socket, rx, reoffer_run, stats_interval, wire_log));
 
     let http_host = util::cfg_str(&cfg, "httpHost", "0.0.0.0");
     let http_port = util::cfg_u64(&cfg, "httpPort", 3000);
     let server = Server::new_ssl(
         format!("{http_host}:{http_port}"),
-        move |request| web_request(request, addr, tx.clone(), rooms.clone()),
+        move |request| web_request(request, tx.clone(), reoffer.clone()),
         certificate,
         private_key,
     )
@@ -156,17 +182,16 @@ pub fn main() {
         addr.ip(),
         port
     );
-    info!("  POST /offer          — submit SDP offer (JSON)");
-    info!("  GET  /answer?room=X  — poll for SDP answer");
+    info!("  POST /offer            — submit SDP offer (JSON: {{type, sdp, room, name, client_id?}})");
+    info!("  GET  /signal?client_id — poll for renegotiation instructions");
 
     server.run();
 }
 
 fn web_request(
     request: &Request,
-    addr: SocketAddr,
-    tx: SyncSender<PairedRoom>,
-    rooms: Rooms,
+    tx: SyncSender<OfferRequest>,
+    reoffer: ReofferState,
 ) -> Response {
     let cors = vec![
         ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
@@ -189,8 +214,9 @@ fn web_request(
     }
 
     let mut resp = match (request.method(), request.url().as_str()) {
-        ("POST", "/offer") => handle_offer(request, addr, tx, rooms),
-        ("GET", url) if url.starts_with("/answer") => handle_get_answer(request, rooms),
+        ("POST", "/offer") => handle_offer(request, &tx),
+        ("GET", url) if url.starts_with("/signal") => handle_signal(request, &reoffer),
+        ("GET", url) if url.starts_with("/answer") => handle_get_answer(request),
         _ => Response::json(&serde_json::json!({"error": "not found"})).with_status_code(404),
     };
 
@@ -200,189 +226,176 @@ fn web_request(
     resp
 }
 
-fn handle_offer(
-    request: &Request,
-    addr: SocketAddr,
-    tx: SyncSender<PairedRoom>,
-    rooms: Rooms,
-) -> Response {
+fn handle_offer(request: &Request, tx: &SyncSender<OfferRequest>) -> Response {
     let Some(mut data) = request.data() else {
         return Response::json(&serde_json::json!({"error": "no body"})).with_status_code(400);
     };
 
-    let offer: SdpOffer = match serde_json::from_reader(&mut data) {
-        Ok(o) => o,
+    // Body: { type, sdp, room?, name?, client_id? }
+    // `room` groups clients into a conference; `name` is a human label for logs.
+    // `client_id` is present only on renegotiation re-offers (the SFU assigns it
+    // in the answer to the initial offer); its absence means a fresh join.
+    let body: serde_json::Value = match serde_json::from_reader(&mut data) {
+        Ok(v) => v,
         Err(e) => {
-            error!("Failed to parse SDP offer: {:?}", e);
-            return Response::json(&serde_json::json!({"error": format!("bad offer: {e}")}))
+            error!("Failed to parse offer body: {:?}", e);
+            return Response::json(&serde_json::json!({"error": format!("bad body: {e}")}))
                 .with_status_code(400);
         }
     };
 
-    let offer_sdp_str = offer.to_sdp_string();
-    let media_info = extract_media_info(&offer_sdp_str);
-    info!("Received offer with {} media lines", media_info.len());
+    let sdp = body.get("sdp").and_then(|v| v.as_str()).unwrap_or_default();
+    if sdp.is_empty() {
+        return Response::json(&serde_json::json!({"error": "missing sdp"}))
+            .with_status_code(400);
+    }
+    let conf_id = body
+        .get("room")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("?")
+        .to_string();
+    let client_id = body
+        .get("client_id")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
 
-    let mut rooms_lock = rooms.lock().unwrap();
+    // Forward the offer to the run loop (which owns every Rtc) and wait for the
+    // answer. A bounded reply channel keeps this request/response synchronous.
+    let (reply_tx, reply_rx) = mpsc::sync_channel::<OfferReply>(1);
+    if tx
+        .send(OfferRequest {
+            client_id,
+            conf_id,
+            name,
+            sdp: sdp.to_string(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::json(&serde_json::json!({"error": "server busy"}))
+            .with_status_code(503);
+    }
 
-    // Find a room waiting for a second client
-    let waiting_room_id = rooms_lock
-        .iter()
-        .find(|(_, room)| room.rtc_b.is_none())
-        .map(|(id, _)| id.clone());
-
-    if let Some(room_id) = waiting_room_id {
-        // Second client joining — pair them
-        info!("Pairing client B into room {}", room_id);
-
-        let room = rooms_lock.get_mut(&room_id).unwrap();
-
-        // Create Rtc for client B — normal DTLS-SRTP mode (no tunnel)
-        let mut rtc_b = Rtc::builder()
-            .set_rtp_mode(true)
-            .build(Instant::now());
-
-        let candidate = Candidate::host(addr, "udp").expect("a host candidate");
-        rtc_b.add_local_candidate(candidate).unwrap();
-
-        let answer_b = match rtc_b.sdp_api().accept_offer(offer) {
-            Ok(a) => a,
-            Err(e) => {
-                error!("Failed to accept offer B: {:?}", e);
-                return Response::json(&serde_json::json!({"error": format!("accept failed: {e}")}))
-                    .with_status_code(500);
-            }
-        };
-
-        let rtc_a = room.rtc_a.take().unwrap();
-        let media_a = room.media_a.clone();
-
-        // Store placeholder so room appears paired (answer_a stays for polling)
-        room.rtc_b = Some(Rtc::new(Instant::now()));
-        room.media_b = media_info.clone();
-
-        // Send to run loop
-        if let Err(e) = tx.send(PairedRoom {
-            room_id: room_id.clone(),
-            rtc_a,
-            rtc_b,
-            media_a,
-            media_b: media_info,
-        }) {
-            error!("Failed to send paired room: {:?}", e);
-            return Response::json(&serde_json::json!({"error": "server busy"}))
-                .with_status_code(503);
-        }
-
-        // Return answer for B immediately
-        let body = serde_json::to_vec(&answer_b).expect("answer to serialize");
-        Response::from_data("application/json", body)
-    } else {
-        // First client — create a new room
-        let room_id = format!("{:08x}", fastrand::u32(..));
-        info!("Client A created room {}", room_id);
-
-        let mut rtc_a = Rtc::builder()
-            .set_rtp_mode(true)
-            .build(Instant::now());
-
-        let candidate = Candidate::host(addr, "udp").expect("a host candidate");
-        rtc_a.add_local_candidate(candidate).unwrap();
-
-        let answer_a = match rtc_a.sdp_api().accept_offer(offer) {
-            Ok(a) => a,
-            Err(e) => {
-                error!("Failed to accept offer A: {:?}", e);
-                return Response::json(&serde_json::json!({"error": format!("accept failed: {e}")}))
-                    .with_status_code(500);
-            }
-        };
-
-        rooms_lock.insert(
-            room_id.clone(),
-            Room {
-                rtc_a: Some(rtc_a),
-                answer_a: Some(answer_a),
-                media_a: media_info,
-                rtc_b: None,
-                media_b: vec![],
-            },
-        );
-
-        Response::json(&serde_json::json!({
-            "status": "waiting",
-            "room_id": room_id,
-            "message": "Waiting for peer. Poll GET /answer?room=<room_id> for your SDP answer."
-        }))
+    match reply_rx.recv() {
+        Ok(reply) if reply.ok => Response::json(&serde_json::json!({
+            "type": "answer",
+            "sdp": reply.answer_sdp,
+            "client_id": reply.client_id,
+        })),
+        Ok(reply) => Response::json(
+            &serde_json::json!({"error": reply.error.unwrap_or_else(|| "offer failed".into())}),
+        )
+        .with_status_code(500),
+        Err(_) => Response::json(&serde_json::json!({"error": "run loop gone"}))
+            .with_status_code(500),
     }
 }
 
-fn handle_get_answer(request: &Request, rooms: Rooms) -> Response {
-    let room_id = request.get_param("room").unwrap_or_default();
-
-    if room_id.is_empty() {
-        return Response::json(&serde_json::json!({"error": "missing ?room= parameter"}))
+/// Renegotiation poll. A client asks how many receive slots it should offer per
+/// media kind; when that exceeds what it currently has, it re-offers to add the
+/// difference. This is what lets a conference grow without a fixed slot pool.
+fn handle_signal(request: &Request, reoffer: &ReofferState) -> Response {
+    let Some(id) = request
+        .get_param("client_id")
+        .and_then(|s| s.parse::<usize>().ok())
+    else {
+        return Response::json(&serde_json::json!({"error": "missing client_id"}))
             .with_status_code(400);
-    }
-
-    let mut rooms_lock = rooms.lock().unwrap();
-
-    let Some(room) = rooms_lock.get_mut(&room_id) else {
-        return Response::json(&serde_json::json!({"error": "room not found"}))
-            .with_status_code(404);
     };
+    let desired = reoffer.lock().unwrap().get(&id).copied().unwrap_or(0);
+    Response::json(&serde_json::json!({
+        "reoffer": desired > 0,
+        "recv_slots": desired,
+    }))
+}
 
-    if room.rtc_b.is_none() {
-        return Response::json(&serde_json::json!({
-            "status": "waiting",
-            "message": "Peer has not joined yet."
-        }))
-        .with_status_code(202);
-    }
-
-    if let Some(answer) = room.answer_a.take() {
-        info!("Returning answer for client A in room {}", room_id);
-        let body = serde_json::to_vec(&answer).expect("answer to serialize");
-        Response::from_data("application/json", body)
-    } else {
-        Response::json(
-            &serde_json::json!({"status": "answered", "message": "Answer already retrieved."}),
-        )
-    }
+/// Legacy endpoint kept for backwards compatibility with old polling clients.
+fn handle_get_answer(_request: &Request) -> Response {
+    Response::json(&serde_json::json!({
+        "status": "answered",
+        "message": "Answer is returned directly by POST /offer."
+    }))
 }
 
 // ─── Main Run Loop ────────────────────────────────────────
 
 struct PercClient {
     id: usize,
-    room_id: String,
-    role: char, // 'A' or 'B'
+    conf_id: String,
+    name: String,
     rtc: Rtc,
     ice_connected: bool,
     dtls_connected: bool,
-    /// Media lines from this client's SDP offer: (mid, kind)
+    /// Media lines from this client's SDP (mid, kind). Starts as the client's
+    /// own sendrecv audio+video and grows on renegotiation as the SFU-driven
+    /// `recvonly` slots are added. Every mid here is writable by the SFU and
+    /// forms this client's pool of receive slots.
     media: Vec<(Mid, MediaKind)>,
     /// SSRC → media kind mapping, learned from incoming RTP packets
     rx_ssrc_kind: HashMap<Ssrc, MediaKind>,
+    /// Receive-slot assignment: (origin client id, kind) → local tx mid. The
+    /// SFU pins each remote participant to a distinct local m-line so this
+    /// client renders one window per participant.
+    slot_for_origin: HashMap<(usize, MediaKind), Mid>,
     // Forwarding stats
     fwd_rtp: u64,
 }
 
-/// Find the peer's tx stream mid for a given media kind.
-fn find_tx_mid_for_kind(
-    peer_media: &[(Mid, MediaKind)],
-    kind: MediaKind,
-) -> Option<Mid> {
-    peer_media
+/// Allocate (or look up) the receive slot on `receiver` that carries media of
+/// `kind` originating from client `origin`. Returns `None` if the receiver has
+/// no free m-line of that kind left (conference larger than its slot pool).
+fn assign_slot(receiver: &mut PercClient, origin: usize, kind: MediaKind) -> Option<Mid> {
+    if let Some(mid) = receiver.slot_for_origin.get(&(origin, kind)) {
+        return Some(*mid);
+    }
+    let used: HashSet<Mid> = receiver
+        .slot_for_origin
         .iter()
-        .find(|(_, k)| *k == kind)
-        .map(|(mid, _)| *mid)
+        .filter(|((_, k), _)| *k == kind)
+        .map(|(_, m)| *m)
+        .collect();
+    let free = receiver
+        .media
+        .iter()
+        .filter(|(_, k)| *k == kind)
+        .map(|(m, _)| *m)
+        .find(|m| !used.contains(m));
+    if let Some(mid) = free {
+        receiver.slot_for_origin.insert((origin, kind), mid);
+        info!(
+            "Conference '{}': client '{}' slot {} → participant #{} {:?}",
+            receiver.conf_id, receiver.name, mid, origin, kind
+        );
+        Some(mid)
+    } else {
+        None
+    }
 }
 
-/// An RTP packet to forward from one client to another.
+/// Recompute, for every participant in `conf_id`, how many receive slots per
+/// media kind it should offer: one per *other* participant. Stored in the shared
+/// [`ReofferState`] so the web thread can hand it out over `GET /signal`. Clients
+/// top up to this number by renegotiating; if they already meet it, it's a no-op.
+fn update_reoffer(clients: &[PercClient], reoffer: &ReofferState, conf_id: &str) {
+    let n = clients.iter().filter(|c| c.conf_id == conf_id).count();
+    let desired = n.saturating_sub(1);
+    let mut map = reoffer.lock().unwrap();
+    for c in clients.iter().filter(|c| c.conf_id == conf_id) {
+        map.insert(c.id, desired);
+    }
+}
+
+/// An RTP packet to fan out from its origin client to every other participant.
 struct ForwardPacket {
-    room_id: String,
-    sender_role: char,
+    conf_id: String,
+    origin_id: usize,
     media_kind: MediaKind,
     // RTP header fields (from sender)
     pt: Pt,
@@ -390,65 +403,167 @@ struct ForwardPacket {
     timestamp: u32,
     marker: bool,
     ext_vals: ExtensionValues,
-    /// The RTP payload — contains E2E ciphertext (opaque to SFU) + OHB
+    /// The RTP payload — contains the inner E2E ciphertext (opaque to the SFU).
     payload: Vec<u8>,
 }
 
-/// A keyframe (PLI/FIR) request to relay back to the original sender.
+/// A keyframe (PLI/FIR) request to relay back to a specific origin sender.
 struct KeyframeReq {
-    room_id: String,
-    requester_role: char,
+    conf_id: String,
+    /// The origin participant the requester is missing a keyframe for, resolved
+    /// from the requester's slot assignment. `None` → broadcast to all senders.
+    target_origin: Option<usize>,
     kind: KeyframeRequestKind,
 }
 
-fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_log: bool) -> ! {
+fn run(
+    socket: UdpSocket,
+    rx: Receiver<OfferRequest>,
+    reoffer: ReofferState,
+    stats_interval: u64,
+    wire_log: bool,
+) -> ! {
     let mut clients: Vec<PercClient> = vec![];
     let mut buf = vec![0; 2000];
     let mut next_id: usize = 0;
     let mut last_stats = Instant::now();
+    let local_addr = socket.local_addr().expect("a local socket address");
     // DIAG: track distinct (ssrc, pt) seen on the wire to confirm what media
     // actually arrives at the SFU, independent of str0m's SSRC discovery.
     let mut seen_wire: std::collections::HashSet<(u32, u8)> = std::collections::HashSet::new();
 
     loop {
-        // Accept paired rooms
-        while let Ok(paired) = rx.try_recv() {
-            let id_a = next_id;
-            next_id += 1;
-            let id_b = next_id;
-            next_id += 1;
+        // Accept joins and renegotiation re-offers. The run loop owns every Rtc,
+        // so all accept_offer work (initial and renegotiation) happens here.
+        while let Ok(req) = rx.try_recv() {
+            let offer = match SdpOffer::from_sdp_string(&req.sdp) {
+                Ok(o) => o,
+                Err(e) => {
+                    error!("Failed to parse SDP offer: {:?}", e);
+                    let _ = req.reply.send(OfferReply {
+                        ok: false,
+                        client_id: 0,
+                        answer_sdp: String::new(),
+                        error: Some(format!("bad offer: {e}")),
+                    });
+                    continue;
+                }
+            };
+            let media = extract_media_info(&req.sdp);
 
-            info!(
-                "Room {} active: client A={}, client B={}",
-                paired.room_id, id_a, id_b
-            );
+            match req.client_id {
+                // Fresh join: build a new Rtc and answer.
+                None => {
+                    let id = next_id;
+                    next_id += 1;
 
-            clients.push(PercClient {
-                id: id_a,
-                room_id: paired.room_id.clone(),
-                role: 'A',
-                rtc: paired.rtc_a,
-                ice_connected: false,
-                dtls_connected: false,
-                media: paired.media_a,
-                rx_ssrc_kind: HashMap::new(),
-                fwd_rtp: 0,
-            });
-            clients.push(PercClient {
-                id: id_b,
-                room_id: paired.room_id,
-                role: 'B',
-                rtc: paired.rtc_b,
-                ice_connected: false,
-                dtls_connected: false,
-                media: paired.media_b,
-                rx_ssrc_kind: HashMap::new(),
-                fwd_rtp: 0,
-            });
+                    let mut rtc = Rtc::builder().set_rtp_mode(true).build(Instant::now());
+                    let candidate = Candidate::host(local_addr, "udp").expect("a host candidate");
+                    rtc.add_local_candidate(candidate).unwrap();
+
+                    let answer = match rtc.sdp_api().accept_offer(offer) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            error!("Failed to accept offer for '{}': {:?}", req.name, e);
+                            let _ = req.reply.send(OfferReply {
+                                ok: false,
+                                client_id: 0,
+                                answer_sdp: String::new(),
+                                error: Some(format!("accept failed: {e}")),
+                            });
+                            continue;
+                        }
+                    };
+
+                    let n_in_conf =
+                        clients.iter().filter(|c| c.conf_id == req.conf_id).count() + 1;
+                    info!(
+                        "Conference '{}': participant #{} '{}' active ({} in conference, {} media lines)",
+                        req.conf_id, id, req.name, n_in_conf, media.len()
+                    );
+
+                    clients.push(PercClient {
+                        id,
+                        conf_id: req.conf_id.clone(),
+                        name: req.name.clone(),
+                        rtc,
+                        ice_connected: false,
+                        dtls_connected: false,
+                        media,
+                        rx_ssrc_kind: HashMap::new(),
+                        slot_for_origin: HashMap::new(),
+                        fwd_rtp: 0,
+                    });
+
+                    // Membership changed — recompute how many receive slots each
+                    // participant should offer, so they all renegotiate to fit.
+                    update_reoffer(&clients, &reoffer, &req.conf_id);
+
+                    let _ = req.reply.send(OfferReply {
+                        ok: true,
+                        client_id: id,
+                        answer_sdp: answer.to_sdp_string(),
+                        error: None,
+                    });
+                }
+                // Renegotiation: accept the re-offer on the existing Rtc and grow
+                // this client's receive-slot pool.
+                Some(id) => {
+                    let Some(client) = clients.iter_mut().find(|c| c.id == id) else {
+                        let _ = req.reply.send(OfferReply {
+                            ok: false,
+                            client_id: id,
+                            answer_sdp: String::new(),
+                            error: Some("unknown client_id".into()),
+                        });
+                        continue;
+                    };
+                    match client.rtc.sdp_api().accept_offer(offer) {
+                        Ok(answer) => {
+                            client.media = media;
+                            info!(
+                                "Conference '{}': client '{}' renegotiated ({} media lines)",
+                                client.conf_id,
+                                client.name,
+                                client.media.len()
+                            );
+                            let _ = req.reply.send(OfferReply {
+                                ok: true,
+                                client_id: id,
+                                answer_sdp: answer.to_sdp_string(),
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            error!("Renegotiation accept failed for '{}': {:?}", client.name, e);
+                            let _ = req.reply.send(OfferReply {
+                                ok: false,
+                                client_id: id,
+                                answer_sdp: String::new(),
+                                error: Some(format!("renegotiation failed: {e}")),
+                            });
+                        }
+                    }
+                }
+            }
         }
 
-        // Remove dead clients
+        // Remove dead clients. If anyone left, recompute receive-slot targets for
+        // the affected conferences so the remaining participants' counts stay
+        // correct (departed slots simply go idle until reused).
+        let before: Vec<(usize, String)> =
+            clients.iter().map(|c| (c.id, c.conf_id.clone())).collect();
         clients.retain(|c| c.rtc.is_alive());
+        if clients.len() != before.len() {
+            let gone_confs: HashSet<String> = before
+                .iter()
+                .filter(|(id, _)| !clients.iter().any(|c| c.id == *id))
+                .map(|(_, conf)| conf.clone())
+                .collect();
+            for conf in &gone_confs {
+                update_reoffer(&clients, &reoffer, conf);
+            }
+        }
 
         // Poll all clients and collect packets to forward
         let mut forwards: Vec<ForwardPacket> = Vec::new();
@@ -471,8 +586,8 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                     }
                     Ok(Output::Event(Event::IceConnectionStateChange(state))) => {
                         info!(
-                            "Room {} Client {} ({}): ICE {:?}",
-                            client.room_id, client.id, client.role, state
+                            "Conf '{}' #{} '{}': ICE {:?}",
+                            client.conf_id, client.id, client.name, state
                         );
                         client.ice_connected = matches!(
                             state,
@@ -481,17 +596,17 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                     }
                     Ok(Output::Event(Event::Connected)) => {
                         info!(
-                            "Room {} Client {} ({}): DTLS connected",
-                            client.room_id, client.id, client.role
+                            "Conf '{}' #{} '{}': DTLS connected",
+                            client.conf_id, client.id, client.name
                         );
                         client.dtls_connected = true;
                     }
                     Ok(Output::Event(Event::MediaAdded(media_added))) => {
                         info!(
-                            "Room {} Client {} ({}): media added mid={} kind={:?} dir={:?}",
-                            client.room_id,
+                            "Conf '{}' #{} '{}': media added mid={} kind={:?} dir={:?}",
+                            client.conf_id,
                             client.id,
-                            client.role,
+                            client.name,
                             media_added.mid,
                             media_added.kind,
                             media_added.direction
@@ -507,8 +622,8 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                             let kind = determine_media_kind(client, &pkt);
                             client.rx_ssrc_kind.insert(ssrc, kind);
                             info!(
-                                "Room {} Client {} ({}): learned SSRC {} → {:?}",
-                                client.room_id, client.id, client.role, ssrc, kind
+                                "Conf '{}' #{} '{}': learned SSRC {} → {:?}",
+                                client.conf_id, client.id, client.name, ssrc, kind
                             );
                             kind
                         } else {
@@ -516,9 +631,9 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                         };
 
                         debug!(
-                            "Room {} {} → {:?} RTP seq={} ts={} pt={} marker={} payload={} bytes",
-                            client.room_id,
-                            client.role,
+                            "Conf '{}' '{}' → {:?} RTP seq={} ts={} pt={} marker={} payload={} bytes",
+                            client.conf_id,
+                            client.name,
                             kind,
                             pkt.header.sequence_number,
                             pkt.header.timestamp,
@@ -528,8 +643,8 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                         );
 
                         forwards.push(ForwardPacket {
-                            room_id: client.room_id.clone(),
-                            sender_role: client.role,
+                            conf_id: client.conf_id.clone(),
+                            origin_id: client.id,
                             media_kind: kind,
                             pt: pkt.header.payload_type,
                             seq_no: pkt.seq_no,
@@ -541,31 +656,35 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                     }
                     Ok(Output::Event(Event::KeyframeRequest(req))) => {
                         debug!(
-                            "Room {} Client {} ({}): keyframe request {:?}",
-                            client.room_id, client.id, client.role, req
+                            "Conf '{}' #{} '{}': keyframe request {:?}",
+                            client.conf_id, client.id, client.name, req
                         );
-                        // The request arrives on this receiver's perspective. We
-                        // relay it back to the ORIGINAL SENDER (the peer in the
-                        // same room) so its encoder emits a fresh keyframe. The
-                        // peer is identified by the opposite role; the actual rx
-                        // SSRC is resolved later when we have a mutable handle to
-                        // the sender.
+                        // The request arrives on a receive slot (req.mid). Map
+                        // that slot back to the participant whose video it
+                        // carries, so we relay the keyframe request to that
+                        // exact sender. If the slot isn't assigned yet, fall
+                        // back to broadcasting to all senders in the conference.
+                        let target_origin = client
+                            .slot_for_origin
+                            .iter()
+                            .find(|((_, k), m)| *k == MediaKind::Video && **m == req.mid)
+                            .map(|((o, _), _)| *o);
                         keyframe_reqs.push(KeyframeReq {
-                            room_id: client.room_id.clone(),
-                            requester_role: client.role,
+                            conf_id: client.conf_id.clone(),
+                            target_origin,
                             kind: req.kind,
                         });
                     }
                     Ok(Output::Event(e)) => {
                         debug!(
-                            "Room {} Client {} ({}): {:?}",
-                            client.room_id, client.id, client.role, e
+                            "Conf '{}' #{} '{}': {:?}",
+                            client.conf_id, client.id, client.name, e
                         );
                     }
                     Err(e) => {
                         error!(
-                            "Room {} Client {} ({}): error {:?}",
-                            client.room_id, client.id, client.role, e
+                            "Conf '{}' #{} '{}': error {:?}",
+                            client.conf_id, client.id, client.name, e
                         );
                         client.rtc.disconnect();
                         break;
@@ -574,37 +693,38 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
             }
         }
 
-        // Forward RTP packets: sender → peer in same room
+        // Fan out each RTP packet to every OTHER participant in its conference.
         for fwd in forwards {
-            let peer_role = if fwd.sender_role == 'A' { 'B' } else { 'A' };
-            if let Some(peer) = clients
-                .iter_mut()
-                .find(|c| c.room_id == fwd.room_id && c.role == peer_role)
-            {
-                if !peer.dtls_connected {
-                    continue;
-                }
+            let receiver_idxs: Vec<usize> = clients
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.conf_id == fwd.conf_id && c.id != fwd.origin_id && c.dtls_connected
+                })
+                .map(|(i, _)| i)
+                .collect();
 
-                // Find the peer's tx stream for the same media kind
-                let tx_mid = find_tx_mid_for_kind(&peer.media, fwd.media_kind);
-                let Some(mid) = tx_mid else {
-                    debug!("No tx mid for {:?} on peer {}", fwd.media_kind, peer.role);
+            for ri in receiver_idxs {
+                let receiver = &mut clients[ri];
+
+                // Pin this origin to one of the receiver's local m-lines so each
+                // participant lands on a distinct receive slot (one window each).
+                let Some(mid) = assign_slot(receiver, fwd.origin_id, fwd.media_kind) else {
+                    debug!(
+                        "Conf '{}' '{}': no free {:?} slot for participant #{}",
+                        receiver.conf_id, receiver.name, fwd.media_kind, fwd.origin_id
+                    );
                     continue;
                 };
 
-                // The payload is opaque E2E encrypted data, produced by the
-                // client's frame-level transform (encryption happens on the
-                // whole encoded frame, before RTP packetization). Because the
-                // SFU forwards at the RTP-packet level, a single encoded frame
-                // may span many packets. We MUST NOT append a per-packet OHB
-                // here: doing so would inject bytes at every packet boundary
-                // inside the frame, which the receiver reassembles into the
-                // (now corrupted) ciphertext, breaking GCM auth for any
-                // multi-packet frame (i.e. all video keyframes).
-                //
-                // The SFU does not rewrite PT/SEQ/marker, so the OHB would be
-                // empty anyway. Forward the payload unmodified.
-                let mut direct = peer.rtc.direct_api();
+                // The payload is opaque E2E ciphertext produced by the sender's
+                // frame-level transform (encryption happens on the whole encoded
+                // frame, before RTP packetization). Because the SFU forwards at
+                // the RTP-packet level, a single encoded frame may span many
+                // packets. We MUST NOT inject any per-packet bytes (e.g. an OHB)
+                // here: doing so would corrupt the reassembled ciphertext and
+                // break GCM auth for any multi-packet frame. Forward verbatim.
+                let mut direct = receiver.rtc.direct_api();
                 if let Some(stream) = direct.stream_tx_by_mid(mid, None) {
                     match stream.write_rtp(
                         fwd.pt,
@@ -612,37 +732,47 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                         fwd.timestamp,
                         Instant::now(),
                         fwd.marker,
-                        fwd.ext_vals,
+                        fwd.ext_vals.clone(),
                         true, // nackable — video packets should be nackable
-                        fwd.payload,
+                        fwd.payload.clone(),
                     ) {
                         Ok(_) => {
-                            // Count stats on the sender side
                             drop(direct);
-                            peer.fwd_rtp += 1;
+                            receiver.fwd_rtp += 1;
                         }
                         Err(e) => {
-                            debug!("write_rtp error for peer {}: {:?}", peer.role, e);
+                            debug!("write_rtp error for '{}': {:?}", receiver.name, e);
                         }
                     }
                 } else {
                     debug!(
-                        "No tx stream for mid={} on peer {} (room {})",
-                        mid, peer.role, fwd.room_id
+                        "No tx stream for mid={} on '{}' (conf '{}')",
+                        mid, receiver.name, fwd.conf_id
                     );
                 }
             }
         }
 
-        // Relay keyframe requests (PLI/FIR) back to the original sender. A
-        // receiver that joins mid-stream needs a keyframe to start decoding;
-        // without this relay its PLIs are dropped and the sender never refreshes.
+        // Relay keyframe requests (PLI/FIR) to the participant whose video the
+        // requesting receiver is missing a keyframe for. A receiver that joins
+        // mid-stream needs a keyframe to start decoding; without this relay its
+        // PLIs are dropped and the sender never refreshes.
         for kreq in keyframe_reqs {
-            let sender_role = if kreq.requester_role == 'A' { 'B' } else { 'A' };
-            if let Some(sender) = clients
-                .iter_mut()
-                .find(|c| c.room_id == kreq.room_id && c.role == sender_role)
-            {
+            let sender_idxs: Vec<usize> = clients
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.conf_id == kreq.conf_id
+                        && match kreq.target_origin {
+                            Some(o) => c.id == o,
+                            None => true, // broadcast fallback
+                        }
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            for si in sender_idxs {
+                let sender = &mut clients[si];
                 // Find every video SSRC we receive from this sender and ask for
                 // a keyframe on its rx stream.
                 let video_ssrcs: Vec<Ssrc> = sender
@@ -656,8 +786,8 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
                     if let Some(stream) = direct.stream_rx(&ssrc) {
                         stream.request_keyframe(kreq.kind);
                         debug!(
-                            "Room {} relayed keyframe request {:?} to sender {} ssrc={}",
-                            kreq.room_id, kreq.kind, sender_role, ssrc
+                            "Conf '{}' relayed keyframe request {:?} to '{}' ssrc={}",
+                            kreq.conf_id, kreq.kind, sender.name, ssrc
                         );
                     }
                 }
@@ -669,8 +799,8 @@ fn run(socket: UdpSocket, rx: Receiver<PairedRoom>, stats_interval: u64, wire_lo
             for client in clients.iter() {
                 if client.fwd_rtp > 0 {
                     info!(
-                        "STATS Room {} → {}: forwarded RTP={}",
-                        client.room_id, client.role, client.fwd_rtp,
+                        "STATS Conf '{}' → '{}': forwarded RTP={}",
+                        client.conf_id, client.name, client.fwd_rtp,
                     );
                 }
             }
